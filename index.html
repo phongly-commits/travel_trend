@@ -117,6 +117,14 @@
     <span class="pill" id="lastRun"><span class="dot"></span> idle</span>
   </header>
 
+  <div id="focusBanner" style="display:none; background:#fef3c7; color:#92400e; border:1px solid #fde68a; border-radius:10px; padding:12px 14px; margin-bottom:14px; font-size:13.5px;"></div>
+
+  <div class="card" style="background:#eff6ff; border-color:#bfdbfe; padding:10px 14px;">
+    <div style="font-size:12.5px; color:#1e40af;">
+      💡 <strong>Keep this dashboard visible during the run.</strong> The Claude API only works while the artifact is the focused panel — if you switch tabs during the ~30s pipeline, calls will pause and retry.
+    </div>
+  </div>
+
   <div class="card">
     <h3>Focus brief &amp; language</h3>
     <textarea id="focus" placeholder='Tell me what trends to track. E.g. "Vietnam travel only — emerging destinations, food/coffee, motorbike trips, nomad scene in Da Nang/HCMC, visa updates"'></textarea>
@@ -164,18 +172,18 @@
 
   <div class="card">
     <h3>📝 Posts to publish <span class="count" id="postsCount">0</span></h3>
-    <div id="seedPostsOut" class="empty">10 ready-to-publish posts will appear here, each tied to a trend cluster.</div>
+    <div id="seedPostsOut" class="empty">Ready-to-publish posts will appear here, each tied to a trend cluster.</div>
     <div class="row" id="seedPostsActions" style="display:none;">
-      <button class="ghost" id="copyAllPosts">Copy all 10 posts</button>
+      <button class="ghost" id="copyAllPosts">Copy all posts</button>
       <button class="ghost" id="downloadPosts">Download .csv</button>
     </div>
   </div>
 
   <div class="card">
     <h3>💬 Comments to seed <span class="count" id="commentsCount">0</span></h3>
-    <div id="seedCommentsOut" class="empty">20 seed comments (≈2 per post) will appear here.</div>
+    <div id="seedCommentsOut" class="empty">Seed comments (≈2 per post) will appear here.</div>
     <div class="row" id="seedCommentsActions" style="display:none;">
-      <button class="ghost" id="copyAllComments">Copy all 20 comments</button>
+      <button class="ghost" id="copyAllComments">Copy all comments</button>
       <button class="ghost" id="downloadComments">Download .csv</button>
     </div>
   </div>
@@ -228,13 +236,78 @@
     let t = s.trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
     const i = t.search(/[\[{]/);
     if (i > 0) t = t.slice(i);
-    // try to find last } or ] for safety
     try { return JSON.parse(t); } catch {}
-    // try truncating to last balanced bracket
-    for (let j = t.length; j > 0; j--) {
-      try { return JSON.parse(t.slice(0, j)); } catch {}
-    }
     return fallback;
+  }
+
+  // Bracket-balanced extractor — finds a balanced [...] or {...} block,
+  // walks string state correctly, and tries repair on common issues.
+  function extractJsonBlock(text, openChar) {
+    if (!text) return null;
+    const closeChar = openChar === '[' ? ']' : '}';
+    let s = String(text).replace(/```[a-z]*\n?/gi, '').replace(/```/g, '');
+    s = s.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+    const start = s.indexOf(openChar);
+    if (start < 0) return null;
+    let depth = 0, inStr = false, esc = false, end = -1;
+    for (let i = start; i < s.length; i++) {
+      const c = s[i];
+      if (esc) { esc = false; continue; }
+      if (inStr) { if (c === '\\') esc = true; else if (c === '"') inStr = false; continue; }
+      if (c === '"') { inStr = true; continue; }
+      if (c === openChar) depth++;
+      else if (c === closeChar) { depth--; if (depth === 0) { end = i; break; } }
+    }
+    if (end > 0) {
+      const candidate = s.slice(start, end + 1);
+      try { return JSON.parse(candidate); } catch {}
+      try { return JSON.parse(candidate.replace(/,(\s*[\]}])/g, '$1')); } catch {}
+    }
+    if (openChar === '[') {
+      const tail = s.slice(start);
+      const lastObjEnd = tail.lastIndexOf('}');
+      if (lastObjEnd > 0) {
+        const candidate = tail.slice(0, lastObjEnd + 1) + ']';
+        try { return JSON.parse(candidate); } catch {}
+        try { return JSON.parse(candidate.replace(/,(\s*[\]}])/g, '$1')); } catch {}
+      }
+    }
+    return null;
+  }
+
+  // Last-resort extractor: scan ALL balanced {...} blocks in the text and parse each one.
+  // Salvages individual objects even when the surrounding array is broken.
+  function extractAllObjects(text) {
+    if (!text) return [];
+    let s = String(text).replace(/```[a-z]*\n?/gi, '').replace(/```/g, '');
+    s = s.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+    const out = [];
+    let depth = 0, inStr = false, esc = false, start = -1;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (esc) { esc = false; continue; }
+      if (inStr) { if (c === '\\') esc = true; else if (c === '"') inStr = false; continue; }
+      if (c === '"') { inStr = true; continue; }
+      if (c === '{') { if (depth === 0) start = i; depth++; }
+      else if (c === '}') {
+        depth--;
+        if (depth === 0 && start >= 0) {
+          const cand = s.slice(start, i + 1);
+          try { out.push(JSON.parse(cand)); }
+          catch { try { out.push(JSON.parse(cand.replace(/,(\s*[\]}])/g, '$1'))); } catch {} }
+          start = -1;
+        }
+      }
+    }
+    return out;
+  }
+
+  // Combined: try the balanced array first, then per-object salvage.
+  function extractArray(text) {
+    const arr = extractJsonBlock(text, '[');
+    if (Array.isArray(arr) && arr.length) return arr;
+    const objs = extractAllObjects(text);
+    return objs.length ? objs : [];
   }
 
   function parseKeywords(text) {
@@ -294,6 +367,44 @@
     setTimeout(() => URL.revokeObjectURL(url), 200);
   }
 
+  // Wrapper around window.cowork.askClaude that:
+  // 1) detects the "Artifact is not currently shown" error response
+  // 2) retries up to 3 times with backoff, prompting the user to bring the artifact back
+  // 3) always returns a string (or throws a clear, actionable error)
+  async function safeAskClaude(prompt, data) {
+    const banner = document.getElementById('focusBanner');
+    let lastErr = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const res = await window.cowork.askClaude(prompt, data || []);
+        // Detect MCP-style error envelope
+        if (res && typeof res === 'object' && (res.isError || res.is_error)) {
+          const msg = String(res.text || res.error || '').trim();
+          lastErr = msg;
+          // If it's the "not currently shown" error, surface a focused warning + wait + retry
+          if (/not currently shown|not visible|not active/i.test(msg)) {
+            banner.style.display = 'block';
+            banner.innerHTML = `⚠ Claude API needs this dashboard to be the active panel. <strong>Click anywhere on this dashboard now</strong> — retrying in 4 seconds (attempt ${attempt + 2}/3)…`;
+            await new Promise(r => setTimeout(r, 4000));
+            continue;
+          }
+          throw new Error(msg || 'Claude returned an error envelope');
+        }
+        // If we got a string, success
+        if (typeof res === 'string') { banner.style.display = 'none'; return res; }
+        // If we got some other object with a text field, use that
+        if (res && typeof res === 'object' && typeof res.text === 'string') { banner.style.display = 'none'; return res.text; }
+        return String(res ?? '');
+      } catch (e) {
+        lastErr = (e && e.message) || String(e);
+        // Brief pause then retry
+        await new Promise(r => setTimeout(r, 1500));
+      }
+    }
+    banner.style.display = 'none';
+    throw new Error(`Claude API failed after 3 attempts: ${lastErr || 'unknown'}. Bring the dashboard to the foreground and retry — or use the deployable web app (outputs/trend-seeder/) which calls the Anthropic SDK directly and isn't affected by this.`);
+  }
+
   async function run() {
     const focus = focusEl.value.trim();
     const lang = langEl.value;
@@ -309,8 +420,8 @@
     try {
       // ----- Step 0: extract keywords -----
       setStage('kw', 'active', 'asking Claude');
-      const kwResp = await window.cowork.askClaude(
-        `Output exactly 3 short search keywords (1-3 words each) likely to surface relevant Threads posts about this focus brief.\n\nRules:\n- Real searchable terms (place names, dishes, themes) — NOT meta-phrases like "travel only"\n- Mix at least 1 specific (a city/dish/attraction) with broader themes\n- Comma-separated on a single line\n- No quotes, no JSON, no prose\n\nExample (Vietnam brief): Hanoi food, Da Nang nomad, Vietnam motorbike\n\nFocus brief: ${focus}`,
+      const kwResp = await safeAskClaude(
+        `Output exactly 3 short search keywords (1-2 words each) for a Threads social-media scraper.\n\nIMPORTANT — these will be used in a scraper with strict timeouts. NARROW keywords are essential:\n- PREFER single named entities: a city ("Hanoi"), a dish ("pho"), a brand ("Highlands Coffee"), an attraction ("Ha Long")\n- AVOID broad multi-word combinations like "Vietnam travel" or "Southeast Asia food" — they time out the scraper\n- AVOID meta-phrases like "travel only" or "emerging destinations"\n- Prefer 1-word keywords when possible; max 2 words\n- Comma-separated on a single line\n- No quotes, no JSON, no prose\n\nGood examples (Vietnam brief): Hanoi, Da Nang, pho\nGood examples (Vietnam brief): Sapa, Hoi An, banh mi\nBad: Vietnam travel, Southeast Asia, emerging cities (too broad — will time out)\n\nFocus brief: ${focus}`,
         []
       );
       keywords = parseKeywords(kwResp);
@@ -323,11 +434,14 @@
       keywords = keywords.slice(0, 3);
       document.getElementById('kwOut').innerHTML = keywords.map(k => `<span class="badge kw" style="margin-right:6px;display:inline-block;margin-bottom:6px;">${escapeHtml(k)}</span>`).join('');
 
-      // ----- Step 1: Apify scrape -----
-      async function scrape(kwList) {
+      // ----- Step 1: Apify scrape (ONE keyword per call, sequential) -----
+      // Multi-keyword Apify calls reliably time out (~60s MCP cap).
+      // Single-keyword calls with small maxPosts finish in 5-20s. We accept partial success.
+      const MAX_POSTS_PER_KW = 5; // smaller = faster, fewer timeouts
+      async function scrapeOne(kw) {
         const apifyRes = await window.cowork.callMcpTool('mcp__apify__call-actor', {
           actor: 'automation-lab/threads-scraper',
-          input: { mode: 'search', searchQueries: kwList, maxPosts: 10 },
+          input: { mode: 'search', searchQueries: [kw], maxPosts: MAX_POSTS_PER_KW },
           previewOutput: true
         });
         let raw = apifyRes;
@@ -336,27 +450,74 @@
           const txt = raw.content.find(c => c.type === 'text')?.text;
           if (txt) raw = safeJsonParse(txt, raw);
         }
-        const items = (raw && raw.items) || [];
-        return items.filter(p => p && p.text && p.type !== 'profile').map(p => ({
-          text: p.text, username: p.username, fullName: p.fullName,
-          likeCount: p.likeCount || 0, replyCount: p.replyCount || 0, repostCount: p.repostCount || 0,
-          date: p.date, url: p.url, searchQuery: p.searchQuery
-        }));
+        // Try multiple shapes: raw.items, raw.result.items, top-level array
+        let items = [];
+        if (raw && Array.isArray(raw.items)) items = raw.items;
+        else if (raw && raw.result && Array.isArray(raw.result.items)) items = raw.result.items;
+        else if (Array.isArray(raw)) items = raw;
+        return { items, raw };
       }
-      setStage('apify', 'active', `pulling ${keywords.length} keywords`);
-      posts = await scrape(keywords);
+
+      const scrapeReport = []; // [{kw, count, ok, error}]
+      const rawSamples = {};
+      setStage('apify', 'active', `0/${keywords.length} keywords`);
+
+      for (let i = 0; i < keywords.length; i++) {
+        const kw = keywords[i];
+        setStage('apify', 'active', `${i + 1}/${keywords.length} · "${kw}"`);
+        try {
+          const { items, raw } = await scrapeOne(kw);
+          rawSamples[kw] = raw;
+          const cleaned = items.filter(p => p && p.text && p.type !== 'profile').map(p => ({
+            text: p.text, username: p.username, fullName: p.fullName,
+            likeCount: p.likeCount || 0, replyCount: p.replyCount || 0, repostCount: p.repostCount || 0,
+            date: p.date, url: p.url, searchQuery: p.searchQuery || kw
+          }));
+          posts.push(...cleaned);
+          scrapeReport.push({ kw, count: cleaned.length, ok: true });
+        } catch (err) {
+          scrapeReport.push({ kw, count: 0, ok: false, error: (err && err.message) || String(err) });
+        }
+      }
+
+      // If still 0 posts after all keywords, try fallback keyword set
       if (!posts.length) {
         const fb = fallbackKeywords(focus).filter(k => !keywords.includes(k));
-        if (fb.length) {
-          setStage('apify', 'active', `retrying with ${fb.join(', ')}`);
-          const retried = await scrape(fb);
-          if (retried.length) {
-            posts = retried; keywords = fb;
-            document.getElementById('kwOut').innerHTML = keywords.map(k => `<span class="badge kw" style="margin-right:6px;display:inline-block;margin-bottom:6px;">${escapeHtml(k)} <span class="small" style="color:#92400e;">(fallback)</span></span>`).join('');
+        for (let i = 0; i < fb.length && !posts.length; i++) {
+          const kw = fb[i];
+          setStage('apify', 'active', `fallback · "${kw}"`);
+          try {
+            const { items } = await scrapeOne(kw);
+            const cleaned = items.filter(p => p && p.text && p.type !== 'profile').map(p => ({
+              text: p.text, username: p.username, fullName: p.fullName,
+              likeCount: p.likeCount || 0, replyCount: p.replyCount || 0, repostCount: p.repostCount || 0,
+              date: p.date, url: p.url, searchQuery: p.searchQuery || kw
+            }));
+            if (cleaned.length) {
+              posts.push(...cleaned);
+              keywords = [kw];
+              scrapeReport.push({ kw, count: cleaned.length, ok: true, fallback: true });
+              document.getElementById('kwOut').innerHTML = `<span class="badge kw" style="margin-right:6px;display:inline-block;margin-bottom:6px;">${escapeHtml(kw)} <span class="small" style="color:#92400e;">(fallback)</span></span>`;
+            }
+          } catch (err) {
+            scrapeReport.push({ kw, count: 0, ok: false, error: (err && err.message) || String(err), fallback: true });
           }
         }
       }
-      setStage('apify', 'done', `${posts.length} posts`);
+
+      const successKws = scrapeReport.filter(r => r.ok && r.count > 0).map(r => r.kw);
+      const failedKws = scrapeReport.filter(r => !r.ok || r.count === 0);
+      setStage('apify', posts.length ? 'done' : 'error',
+        posts.length ? `${posts.length} posts (${successKws.length}/${scrapeReport.length} keywords ok)` : 'all keywords failed');
+
+      // Surface scrape report in error box if any keyword failed
+      if (failedKws.length) {
+        const lines = failedKws.map(r => `• "${r.kw}" — ${r.error || (r.count === 0 ? 'no posts' : 'failed')}`).join('<br>');
+        const note = posts.length
+          ? `<div class="err" style="background:#fef3c7;color:#92400e;border-color:#fde68a;">Some keywords had issues (got ${posts.length} from others):<br>${lines}</div>`
+          : `<div class="err">All keywords failed:<br>${lines}<br><br>Likely cause: Apify timeout on broader keywords. Try more specific terms (e.g. a single city) or wait and retry.</div>`;
+        errBox.innerHTML = note;
+      }
       const postsHtml = posts.slice(0, 8).map(p => `
         <div class="post">
           <div class="meta">
@@ -374,7 +535,7 @@
 
       // ----- Step 2 (Claude 1): clean & tag -----
       setStage('c1', 'active', 'tagging posts');
-      const c1Resp = await window.cowork.askClaude(
+      const c1Resp = await safeAskClaude(
         `For EACH input post, extract: destination (place or "general"), sentiment ("positive"|"negative"|"mixed"), themes (1-3 short tags). Return ONLY a JSON array, one object per post in input order. No prose, no code fences.`,
         posts.slice(0, 25).map(p => ({ text: p.text, keyword: p.searchQuery }))
       );
@@ -384,7 +545,7 @@
 
       // ----- Step 3 (Claude 2): cluster -----
       setStage('c2', 'active', 'clustering');
-      const c2Resp = await window.cowork.askClaude(
+      const c2Resp = await safeAskClaude(
         `Cluster these tagged posts into 3-5 distinct TREND CLUSTERS. For each: title (4-7 punchy words), destinations (array), direction ("rising"|"falling"|"stable"|"shifting"), evidence (1-3 bullets). Return ONLY a JSON array. No prose, no code fences.`,
         tagged
       );
@@ -403,20 +564,98 @@
             </div>`).join('')
         : '<div class="empty">No clusters detected.</div>';
 
-      // ----- Step 4 (Claude 3): seeding pack (10 posts + 20 comments) -----
-      setStage('c3', 'active', 'writing seeding pack');
+      // ----- Step 4 (Claude 3): seeding pack — split into 2 calls for reliability -----
       const langName = lang === 'vi' ? 'Vietnamese (Tiếng Việt)' : 'English';
       const langExample = lang === 'vi'
-        ? 'e.g. "ai vừa đi sleeper train từ Hà Nội ra Sapa chưa? Đáng tiền không hay là cú lừa?"'
+        ? 'e.g. "ai vừa đi sleeper train từ Hà Nội ra Sapa chưa? đáng tiền không hay là cú lừa?"'
         : 'e.g. "anyone took the sleeper train from Hanoi to Sapa lately? worth the hype or actually painful?"';
-      const c3Resp = await window.cowork.askClaude(
-        `You are generating a SEEDING PACK for a Threads marketer.\n\nLanguage: write all "text" fields in ${langName}. ${langExample}\n\nGenerate:\n\n1. **10 posts** to publish, each riding one of the trend clusters. Mix angles across the 10:\n   "hot_take" | "question" | "list" | "personal_story" | "comparison" | "prediction" | "polarizing" | "helpful_tip" | "fomo_trigger" | "behind_the_scenes"\n   - Authentic Threads voice (lowercase casual where natural, no corporate speak)\n   - Length 60-200 chars typical, max 280\n   - End with a soft engagement hook\n\n2. **20 comments** to seed under those posts (about 2 per post). Mix types:\n   "agree_add" | "light_pushback" | "personal_anecdote" | "ask_more" | "share_experience" | "compliment_question"\n   - Sound like real users, not the brand\n   - Length 20-100 chars typical\n   - Reference the post content naturally\n\nReturn ONLY valid JSON with this exact shape:\n{\n  "posts": [{"id":1,"angle":"...","cluster":"...","text":"..."}, ... 10 items],\n  "comments": [{"post_id":1,"type":"...","text":"..."}, ... 20 items distributed across post_ids 1-10]\n}\n\nNo prose, no code fences.`,
-        clusters
-      );
-      seedPack = safeJsonParse(c3Resp, null);
-      if (!seedPack || !Array.isArray(seedPack.posts) || !Array.isArray(seedPack.comments)) {
-        throw new Error('Seeding pack JSON malformed. See debug panel.');
+
+      // 4a. Generate posts as PLAIN TEXT (one per line) — no JSON parsing required
+      setStage('c3', 'active', 'writing posts');
+      const angles = ['hot_take', 'question', 'personal_story', 'comparison', 'helpful_tip'];
+      let postsRaw = '';
+      let postLines = [];
+      for (let attempt = 0; attempt < 2; attempt++) {
+        postsRaw = await safeAskClaude(
+          `Write 5 short Threads posts for a marketer.\n\nLanguage: ${langName}. ${langExample}\n\nRules:\n- Each post: 60-180 characters\n- Authentic Threads voice (lowercase casual where natural, no corporate speak)\n- End with a soft engagement hook\n- Each post on its OWN LINE\n- Use a blank line BETWEEN posts\n- NO numbering, NO bullets, NO quotes wrapping the text, NO labels, NO JSON\n- Just 5 posts separated by blank lines\n\nThese posts should ride the trends in this data:\n${JSON.stringify(clusters).slice(0, 1500)}`,
+          []
+        );
+        // Parse by splitting on blank-line groups, then on lines, then by /^\d+[.)]\s+/ list markers
+        postLines = postsRaw
+          .split(/\n\s*\n/)
+          .flatMap(block => block.split('\n'))
+          .map(l => l.trim()
+            .replace(/^[\d]+[.)\-]\s*/, '')         // strip "1. " or "1) " or "1- "
+            .replace(/^[-*•]\s+/, '')               // strip bullets
+            .replace(/^["'`]+|["'`]+$/g, '')        // strip surrounding quotes
+            .replace(/^\*\*.*?\*\*:?\s*/, '')       // strip "**Post 1:**" labels
+            .replace(/^post\s*\d+\s*[:\-]\s*/i, '') // strip "Post 1:" labels
+            .trim()
+          )
+          .filter(l => l.length >= 30 && l.length <= 400);
+        if (postLines.length >= 1) break;
       }
+      let seedPosts = postLines.slice(0, 10).map((text, i) => ({
+        id: i + 1,
+        angle: angles[i % angles.length],
+        cluster: clusters[i % Math.max(1, clusters.length)]?.title || '',
+        text
+      }));
+
+      if (seedPosts.length === 0) {
+        // Last resort: present the raw text so user can salvage manually
+        document.getElementById('debug').textContent = JSON.stringify({ stage: 'posts', raw: postsRaw }, null, 2);
+        if (postsRaw && postsRaw.trim().length > 30) {
+          seedPosts = [{ id: 1, angle: 'raw', cluster: 'unparsed', text: postsRaw.trim().slice(0, 800) }];
+          const warn = document.createElement('div');
+          warn.className = 'err';
+          warn.style.cssText = 'background:#fef3c7;color:#92400e;border-color:#fde68a;';
+          warn.innerHTML = 'Could not split into individual posts — showing the raw model response below for you to manually copy/edit.';
+          errBox.appendChild(warn);
+        } else {
+          throw new Error('Claude returned an empty response. Try again, or simplify your focus brief.');
+        }
+      }
+      setStage('c3', 'active', `${seedPosts.length} posts · writing comments`);
+
+      // 4b. Generate comments as plain text too
+      let commentsRaw = '';
+      let commentLines = [];
+      const targetComments = Math.min(10, Math.max(2, seedPosts.length * 2));
+      for (let attempt = 0; attempt < 2; attempt++) {
+        commentsRaw = await safeAskClaude(
+          `Write ${targetComments} short SEED COMMENTS for these Threads posts (so the posts look engaging when published).\n\nLanguage: ${langName}.\n\nFormat each line EXACTLY as:\n[POST_NUMBER] comment text\n\nExample:\n[1] thật á? mình tưởng đắt lắm chứ\n[2] mê quá đi mất\n\nRules:\n- Each comment 20-80 chars\n- Sound like a real user, not the brand\n- Distribute across all post numbers 1-${seedPosts.length}\n- One comment per line, no blank lines between\n- NO JSON, NO labels other than [N]\n\nThe ${seedPosts.length} posts:\n${seedPosts.map((p, i) => `[${i + 1}] ${p.text}`).join('\n')}`,
+          []
+        );
+        commentLines = commentsRaw
+          .split('\n')
+          .map(l => l.trim())
+          .filter(Boolean)
+          .map(l => {
+            // expect "[N] text" or "N. text" or "N) text"
+            const m = l.match(/^\s*[\[\(]?\s*(\d+)\s*[\]\):.\-]?\s*(.+)$/);
+            if (m) return { post_id: Math.max(1, Math.min(seedPosts.length, parseInt(m[1], 10))), text: m[2].replace(/^["'`]+|["'`]+$/g, '').trim() };
+            // fallback: assign round-robin
+            return { post_id: 0, text: l.replace(/^["'`]+|["'`]+$/g, '').trim() };
+          })
+          .filter(c => c.text.length >= 8 && c.text.length <= 200);
+        if (commentLines.length >= 1) break;
+      }
+      let seedComments = commentLines.slice(0, 20).map((c, i) => ({
+        post_id: c.post_id > 0 ? c.post_id : ((i % seedPosts.length) + 1),
+        type: 'comment',
+        text: c.text
+      }));
+
+      if (seedComments.length === 0) {
+        const warn = document.createElement('div');
+        warn.className = 'err';
+        warn.style.cssText = 'background:#fef3c7;color:#92400e;border-color:#fde68a;';
+        warn.innerHTML = `Got ${seedPosts.length} posts but no comments could be parsed. Click <strong>Save & analyze</strong> again to retry just comments.`;
+        errBox.appendChild(warn);
+      }
+
+      seedPack = { posts: seedPosts, comments: seedComments };
       setStage('c3', 'done', `${seedPack.posts.length} posts + ${seedPack.comments.length} comments`);
 
       // render seeding posts
@@ -491,7 +730,7 @@
         downloadCsv('seed_comments.csv', rows);
       };
 
-      document.getElementById('debug').textContent = JSON.stringify({ keywords, postCount: posts.length, tagged, clusters, seedPack }, null, 2);
+      document.getElementById('debug').textContent = JSON.stringify({ keywords, scrapeReport, rawSamples: Object.keys(rawSamples), postCount: posts.length, tagged, clusters, seedPack }, null, 2);
       const stamp = new Date().toLocaleString();
       localStorage.setItem(LAST_KEY, stamp);
       lastRunEl.innerHTML = `<span class="dot"></span> last run: ${stamp}`;
